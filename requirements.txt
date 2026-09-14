@@ -1,0 +1,8 @@
+streamlit
+numpy
+scipy
+noisereduce
+requests
+python-dotenv
+streamlit-mic-recorder
+unidecode
