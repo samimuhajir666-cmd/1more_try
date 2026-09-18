@@ -1,4 +1,3 @@
-
 import io
 import os
 import re
@@ -9,17 +8,22 @@ import scipy.io.wavfile as wav
 import scipy.signal as signal
 import streamlit as st
 from collections import Counter
-from dotenv import load_dotenv
 from streamlit_mic_recorder import mic_recorder
 from unidecode import unidecode
 from pathlib import Path
 from datetime import datetime
 
+# Optional: only for local development
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # ============================================================
 # PAGE CONFIG
 # ============================================================
 st.set_page_config(page_title="Voice Agent", page_icon="🎤", layout="centered")
-load_dotenv()
 
 # ============================================================
 # CONFIG
@@ -35,7 +39,7 @@ class Config:
         "NumPy", "API", "machine learning", "function", "variable",
         "Assalam", "Alaikum", "Namaz", "Salam", "Allah", "Quran",
         "Ramadan", "InshaAllah", "MashaAllah", "Alhamdulillah",
-        "Shukriya", "Khuda Hafiz", "Allah Hafiz","hello" ,"hello 123"
+        "Shukriya", "Khuda Hafiz", "Allah Hafiz", "hello", "hello 123",
         "assalamoalaikum"
     ]
 
@@ -64,16 +68,23 @@ class Config:
     PROFILE_META = PROFILE_DIR / "profile_meta.json"
 
 # ============================================================
-# API KEY
+# API KEY (Streamlit Cloud + Local compatible)
 # ============================================================
 def get_api_key():
+    # 1. Streamlit Secrets (for Streamlit Cloud)
+    try:
+        key = st.secrets.get("DEEPGRAM_API_KEY")
+        if key:
+            return key
+    except Exception:
+        pass
+
+    # 2. Environment variable (for local)
     key = os.getenv("DEEPGRAM_API_KEY")
     if key:
         return key
-    try:
-        return st.secrets.get("DEEPGRAM_API_KEY")
-    except Exception:
-        return None
+
+    return None
 
 # ============================================================
 # AUDIO UTILS
@@ -102,21 +113,17 @@ def smart_vad_boost(audio, sr, boost_db=None, frame_ms=None):
         frame_len = int(sr * frame_ms / 1000)
         if frame_len < 1 or len(audio) < frame_len * 2:
             return audio
-
         n_frames = len(audio) // frame_len
         energies = np.array([
             np.sqrt(np.mean(audio[i*frame_len:(i+1)*frame_len] ** 2) + 1e-10)
             for i in range(n_frames)
         ])
-
         noise_floor = np.percentile(energies, 12)
         threshold = max(noise_floor * 1.55, Config.MIN_RMS_ENERGY / 32767.0 * 0.5)
         speech_mask = energies > threshold
         speech_ratio = np.mean(speech_mask)
         overall_rms = np.sqrt(np.mean(audio ** 2) + 1e-10)
-
         is_soft = overall_rms < (Config.MIN_RMS_ENERGY * 2.6) or speech_ratio < 0.48
-
         if is_soft and speech_ratio > 0.02:
             boost = 10 ** (boost_db / 20)
             audio_out = audio.copy()
@@ -193,17 +200,14 @@ def adaptive_preprocess(audio, sr):
     peak = np.max(np.abs(audio))
     is_loud = peak > 25000
     is_soft = overall_rms < (Config.MIN_RMS_ENERGY * 2.5)
-
     voice_type = "loud" if is_loud else ("soft" if is_soft else "normal")
     snr_zone = "safe" if snr >= Config.SNR_SAFE_MIN else ("degraded" if snr >= Config.SNR_DEGRADED_MIN else "critical")
-
     diagnostics = {
         "snr_db": round(snr, 1),
         "voice_type": voice_type,
         "snr_zone": snr_zone,
         "filters_applied": []
     }
-
     if snr_zone == "safe":
         audio = highpass_filter(audio, sr, 80)
         diagnostics["filters_applied"].append("highpass_80")
@@ -215,14 +219,12 @@ def adaptive_preprocess(audio, sr):
         audio = highpass_filter(audio, sr, 120)
         audio = spectral_noise_reduce(audio, sr, True)
         diagnostics["filters_applied"].append("highpass_120 + aggressive NR")
-
     if is_loud:
         audio = apply_agc_peak_limiter(audio, sr)
         diagnostics["filters_applied"].append("agc_limiter")
     elif is_soft:
         audio = smart_vad_boost(audio, sr)
         diagnostics["filters_applied"].append("strong_soft_boost")
-
     audio = normalize_audio(audio)
     return np.clip(audio, -32768, 32767).astype(np.int16), diagnostics
 
@@ -249,7 +251,7 @@ def preprocess_audio(audio_bytes):
         return None
 
 # ============================================================
-# SPEAKER SELECTION (Architecture aligned - Lock + Continuity)
+# SPEAKER SELECTION
 # ============================================================
 def pick_better_speaker(deepgram_data, last_speaker=None, locked_speaker=None):
     try:
@@ -264,7 +266,6 @@ def pick_better_speaker(deepgram_data, last_speaker=None, locked_speaker=None):
             text = alternatives[0].get("transcript", "").strip()
             conf = float(alternatives[0].get("confidence", 0.0) or 0.0)
             return text, conf, 1, None
-
         speaker_data = {}
         for w in words:
             spk = w.get("speaker", 0)
@@ -273,24 +274,19 @@ def pick_better_speaker(deepgram_data, last_speaker=None, locked_speaker=None):
             speaker_data[spk]["words"].append(w.get("word", ""))
             speaker_data[spk]["confidences"].append(float(w.get("confidence", 0.0)))
             speaker_data[spk]["end"] = w.get("end", speaker_data[spk]["end"])
-
         scores = {}
         for spk, data in speaker_data.items():
             word_count = len(data["words"])
             avg_conf = np.mean(data["confidences"]) if data["confidences"] else 0.0
             duration = max(0.1, data["end"] - data["start"])
             score = (word_count * 1.3) + (avg_conf * 11.0) + (duration * 2.8)
-
             if last_speaker is not None and spk == last_speaker:
                 score *= 1.60
             if locked_speaker is not None and spk == locked_speaker:
-                score *= 2.25   # Strong lock priority
-
+                score *= 2.25
             scores[spk] = score
-
         if not scores:
             return "", 0.0, 0, None
-
         best = max(scores, key=scores.get)
         data = speaker_data[best]
         text = " ".join(data["words"]).strip()
@@ -354,7 +350,6 @@ def transcribe_deepgram(audio_bytes, last_speaker=None, locked_speaker=None):
     if not api_key:
         return {"text": "", "confidence": 0.0, "speaker_count": 0, "success": False,
                 "error": "DEEPGRAM_API_KEY missing", "speaker_id": None}
-
     params = [
         ("model", Config.DEEPGRAM_MODEL),
         ("language", Config.DEEPGRAM_LANGUAGE),
@@ -366,31 +361,24 @@ def transcribe_deepgram(audio_bytes, last_speaker=None, locked_speaker=None):
     ]
     for term in Config.KEYTERMS:
         params.append(("keywords", term))
-
     headers = {"Authorization": f"Token {api_key}", "Content-Type": "audio/wav"}
-
     try:
         r = requests.post(Config.DEEPGRAM_URL, params=params, headers=headers,
                           data=audio_bytes, timeout=Config.DEEPGRAM_TIMEOUT)
     except requests.RequestException as e:
         return {"text": "", "confidence": 0.0, "speaker_count": 0, "success": False,
                 "error": f"Network: {e}", "speaker_id": None}
-
     if r.status_code != 200:
         return {"text": "", "confidence": 0.0, "speaker_count": 0, "success": False,
                 "error": f"Deepgram {r.status_code}", "speaker_id": None}
-
     data = r.json()
     text, conf, spk_count, speaker_id = pick_better_speaker(
         data, last_speaker=last_speaker, locked_speaker=locked_speaker
     )
-
     text = clean_roman_urdu(combine_number_multipliers(convert_numbers_to_digits(to_roman_urdu(text))))
-
     if not text or len(text.strip()) < 2:
         return {"text": "[No clear speech detected]", "confidence": 0.0, "speaker_count": spk_count,
                 "success": True, "error": None, "speaker_id": speaker_id}
-
     return {"text": text, "confidence": conf, "speaker_count": spk_count,
             "success": True, "error": None, "speaker_id": speaker_id}
 
@@ -402,13 +390,10 @@ def process_voice_input(audio_bytes, last_speaker=None, locked_speaker=None):
     if cleaned is None:
         return {"success": False, "text": "", "confidence": 0.0, "speaker_count": 0,
                 "diagnostics": None, "speaker_id": None, "error": "Audio too quiet or too short."}
-
     result = transcribe_deepgram(cleaned["bytes"], last_speaker=last_speaker, locked_speaker=locked_speaker)
-
     if not result["success"]:
         return {"success": False, "text": "", "confidence": 0.0, "speaker_count": 0,
                 "diagnostics": cleaned["diagnostics"], "speaker_id": None, "error": result.get("error")}
-
     return {
         "success": True,
         "text": result["text"],
@@ -425,7 +410,6 @@ def process_voice_input(audio_bytes, last_speaker=None, locked_speaker=None):
 st.title("🎤 Voice Agent — Final")
 st.caption("Soft Voice Boost + Speaker Lock + Continuity + Clean Roman Urdu")
 
-# Session state
 defaults = {
     "last_text": "", "last_conf": 0.0, "last_speakers": 0,
     "last_diag": None, "last_speaker_id": None, "locked_speaker_id": None
@@ -434,28 +418,26 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# Speaker Lock Section
-st.subheader(" Speakers Control")
+st.subheader("Speakers Control")
 c1, c2 = st.columns(2)
 with c1:
-    if st.button(" Lock Current Speaker", use_container_width=True):
+    if st.button("Lock Current Speaker", use_container_width=True):
         if st.session_state.last_speaker_id is not None:
             st.session_state.locked_speaker_id = st.session_state.last_speaker_id
             st.success(f"Speaker {st.session_state.locked_speaker_id} locked as Target")
         else:
-            st.warning("first record your voice then lock your voice")
+            st.warning("First record your voice then lock your voice")
 with c2:
-    if st.button(" Unlock", use_container_width=True):
+    if st.button("Unlock", use_container_width=True):
         st.session_state.locked_speaker_id = None
         st.info("Lock removed")
 
 if st.session_state.locked_speaker_id is not None:
     st.success(f"Target Locked → Speaker ID: **{st.session_state.locked_speaker_id}**")
 
-# Recording
 audio_output = mic_recorder(
-    start_prompt=" Start Recording",
-    stop_prompt=" Stop Recording",
+    start_prompt="Start Recording",
+    stop_prompt="Stop Recording",
     just_once=True,
     use_container_width=True,
     format="wav",
@@ -469,7 +451,6 @@ if audio_output and audio_output.get("bytes"):
             last_speaker=st.session_state.last_speaker_id,
             locked_speaker=st.session_state.locked_speaker_id
         )
-
     if result["success"]:
         st.session_state.last_text = result["text"]
         st.session_state.last_conf = result["confidence"]
@@ -481,7 +462,6 @@ if audio_output and audio_output.get("bytes"):
     else:
         st.error(result.get("error", "Failed"))
 
-# Diagnostics
 if st.session_state.last_diag:
     d = st.session_state.last_diag
     with st.expander("Diagnostics"):
@@ -507,5 +487,4 @@ else:
 if st.button("Clear", use_container_width=True):
     for k in defaults:
         st.session_state[k] = defaults[k]
-    st.rerun()    
-
+    st.rerun()
