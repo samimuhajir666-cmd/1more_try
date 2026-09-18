@@ -60,10 +60,10 @@ class Config:
 
     # Distance / far-field compensation
     FAR_FIELD_RMS_MULT      = 3.2
-    COMPRESSOR_TARGET_RATIO = 0.34
-    COMPRESSOR_MAX_GAIN_DB  = 20.0
+    COMPRESSOR_TARGET_RATIO = 0.22   # gentler than before — avoids over-driving quiet clips into artifacts
+    COMPRESSOR_MAX_GAIN_DB  = 12.0   # was 20 — 20dB combined with pre-emphasis was distorting speech
     COMPRESSOR_SMOOTHING    = 0.35
-    PRE_EMPHASIS_COEFF      = 0.30
+    PRE_EMPHASIS_COEFF      = 0.15   # was 0.30 — a lighter lift is less likely to amplify noise into garbage
 
 # ============================================================
 # API KEY
@@ -422,17 +422,52 @@ def transcribe_deepgram(audio_bytes, last_speaker=None):
     return {"text": text, "confidence": conf, "speaker_count": spk_count, "success": True, "error": None}
 
 # ============================================================
-# MAIN PROCESS
+# MAIN PROCESS (with automatic safe-retry if heavy processing
+# accidentally garbles a clean recording)
 # ============================================================
+def _minimal_clean(audio_bytes):
+    """A deliberately light touch: just high-pass filter + normalize,
+    no gain-boost / compression / pre-emphasis. Used as a fallback when
+    the full adaptive chain returns nothing — protects against the case
+    where aggressive far-field processing distorts an already-clear clip."""
+    try:
+        sr, audio = wav.read(io.BytesIO(audio_bytes))
+        if len(audio.shape) > 1:
+            audio = np.mean(audio, axis=1)
+        audio = audio.astype(np.float64)
+        audio = highpass_filter(audio, sr, 80)
+        audio = normalize_audio(audio)
+        audio = np.clip(audio, -32768, 32767).astype(np.int16)
+        buf = io.BytesIO()
+        wav.write(buf, sr, audio)
+        buf.seek(0)
+        return buf.read()
+    except Exception:
+        return None
+
 def process_voice_input(audio_bytes, last_speaker=None):
     cleaned = preprocess_audio(audio_bytes)
     if cleaned is None:
         return {"success": False, "text": "", "confidence": 0.0, "speaker_count": 0,
                 "diagnostics": None, "error": "Audio too quiet or too short."}
+
     result = transcribe_deepgram(cleaned["bytes"], last_speaker=last_speaker)
     if not result["success"]:
         return {"success": False, "text": "", "confidence": 0.0, "speaker_count": 0,
                 "diagnostics": cleaned["diagnostics"], "error": result.get("error")}
+
+    # Safety net: if the fully-processed audio produced nothing, the
+    # processing itself may have distorted a perfectly fine recording —
+    # retry once with minimal, non-destructive cleaning.
+    if result["text"] == "[No clear speech detected]":
+        light_bytes = _minimal_clean(audio_bytes)
+        if light_bytes:
+            retry = transcribe_deepgram(light_bytes, last_speaker=last_speaker)
+            if retry["success"] and retry["text"] != "[No clear speech detected]":
+                cleaned["diagnostics"]["filters_applied"].append("retried_with_minimal_processing")
+                return {"success": True, "text": retry["text"], "confidence": retry["confidence"],
+                        "speaker_count": retry["speaker_count"], "diagnostics": cleaned["diagnostics"], "error": None}
+
     return {"success": True, "text": result["text"], "confidence": result["confidence"],
             "speaker_count": result["speaker_count"], "diagnostics": cleaned["diagnostics"], "error": None}
 
