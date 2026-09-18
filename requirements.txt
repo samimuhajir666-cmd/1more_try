@@ -9,3 +9,10 @@ transformers>=4.40,<5
 accelerate>=0.30
 sentencepiece>=0.2
 speechbrain>=1.0
+
+streamlit-mic-recorder
+numpy
+scipy
+requests
+unidecode
+python-dotenv
