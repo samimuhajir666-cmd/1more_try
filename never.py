@@ -80,6 +80,7 @@ class Config:
     MATCH_SIMILARITY_THRESHOLD = 0.70   # a speaker cluster must reach this to be "you"
     MATCH_MARGIN = 0.07                 # ...and beat the next-closest speaker by this much
     MAX_CLUSTER_SECONDS_FOR_EMBEDDING = 6.0
+    ENROLL_MIN_SNR = 9.0   # separate, more realistic floor for a laptop/browser mic
 
 Config.PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -453,18 +454,28 @@ def delete_profile(name):
         if p.exists():
             p.unlink()
 
-def enrollment_quality_check(audio_int16, sr):
-    """Lightweight quality gate for enrollment clips, reusing the SNR/
-    silence helpers already in this file."""
+def enrollment_quality_check(audio_int16, sr, allow_override=False):
+    """
+    Lightweight quality gate for enrollment clips.
+
+    Low-frequency rumble (laptop fan, AC hum, desk vibration) is picked up
+    by cheap mics constantly and used to badly deflate a raw SNR estimate
+    even when the actual speech is perfectly clear — so we high-pass
+    filter FIRST (same 80Hz cut used elsewhere in this file) before
+    measuring, and use a separate, more realistic floor for enrollment
+    (ENROLL_MIN_SNR) instead of the stricter transcription-time threshold.
+    """
     duration = len(audio_int16) / sr
+    snr = estimate_snr(highpass_filter(audio_int16.astype(np.float64), sr, 80), sr)
+
     if duration < Config.ENROLL_MIN_SEC:
-        return False, f"Too short ({duration:.1f}s, need ≥ {Config.ENROLL_MIN_SEC}s)."
+        return False, f"Too short ({duration:.1f}s, need ≥ {Config.ENROLL_MIN_SEC}s).", snr
     if is_silent(audio_int16.astype(np.float64)):
-        return False, "Too quiet — move closer to the mic and try again."
-    snr = estimate_snr(audio_int16.astype(np.float64), sr)
-    if snr < Config.SNR_DEGRADED_MIN:
-        return False, f"Too much background noise (SNR {snr:.1f} dB). Record somewhere quieter."
-    return True, f"OK — SNR {snr:.1f} dB, {duration:.1f}s."
+        return False, "Too quiet — move closer to the mic and try again.", snr
+    if snr < Config.ENROLL_MIN_SNR and not allow_override:
+        return False, (f"Too much background noise (SNR {snr:.1f} dB). Try: move closer to the mic, "
+                        f"turn off laptop fan/AC noise, or use the override below."), snr
+    return True, f"OK — SNR {snr:.1f} dB, {duration:.1f}s.", snr
 
 # ============================================================
 # SPEAKER GROUPING (from Deepgram diarization words)
@@ -765,6 +776,13 @@ with tab_enroll:
         "recording, not your actual voice."
     )
     profile_name = st.text_input("Profile name (e.g. your name)", key="profile_name_input")
+    override = st.checkbox(
+        "⚠️ My room is just naturally a bit noisy — accept this clip anyway",
+        key="enroll_override",
+        help="Use this if the clip sounds fine to you but keeps getting rejected. "
+             "It still extracts a voiceprint from whatever speech is there; if the "
+             "clip is too noisy the lock just won't match as reliably later.",
+    )
 
     rec = mic_recorder(start_prompt="🎙️ Record enrollment clip", stop_prompt="🛑 Stop",
                         just_once=True, format="wav", key="enroll_mic")
@@ -773,7 +791,9 @@ with tab_enroll:
         if len(raw.shape) > 1:
             raw = raw.mean(axis=1)
         raw = raw.astype(np.int16)
-        ok, msg = enrollment_quality_check(raw, sr)
+        ok, msg, snr = enrollment_quality_check(raw, sr, allow_override=override)
+        st.caption(f"Measured SNR (after noise-floor filtering): **{snr:.1f} dB** "
+                    f"(need ≥ {Config.ENROLL_MIN_SNR:.0f} dB, or use the override above)")
         if ok:
             st.success(f"✅ {msg}")
             st.session_state.enroll_clips.append((raw, sr))
